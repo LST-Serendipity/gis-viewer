@@ -315,7 +315,8 @@ function buildShx(features, shapeType) {
     return bytes
   })
 
-  const fileLength = 50 + numRecords * 4
+  const recordHeaderBytes = features.length * 8
+  const fileLength = 50 + (totalContentBytes + recordHeaderBytes) / 2
   headerView.setInt32(24, fileLength, false)
   headerView.setInt32(28, 1000, false)
   headerView.setInt32(32, shapeType, true)
@@ -350,7 +351,7 @@ function buildDbf(features) {
   })
 
   const headerLen = 32 + headers.length * 32 + 1
-  const recordLen = headers.reduce((sum, h) => sum + h.length, 0) + 2
+  const recordLen = headers.reduce((sum, h) => sum + h.length, 0) + 1
   const fileLen = headerLen + features.length * recordLen + 1
 
   const arr = new ArrayBuffer(fileLen)
