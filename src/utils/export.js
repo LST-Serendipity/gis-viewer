@@ -20,20 +20,29 @@ export async function exportShapefile(geojson, fileName) {
   
   try {
     const features = geojson.type === 'FeatureCollection' ? geojson.features : [geojson]
-    const pointFeatures = features.filter(f => f.geometry?.type === 'Point')
-    const lineFeatures = features.filter(f => f.geometry?.type === 'LineString')
-    const polygonFeatures = features.filter(f => f.geometry?.type === 'Polygon')
+    const validFeatures = features.filter(f => f.geometry?.type)
 
-    if (!features.length) {
-      throw new Error('没有可导出的要素')
+    if (!validFeatures.length) {
+      throw new Error('没有可导出的要素（所有要素缺少 geometry）')
     }
+
+    const supportedTypes = ['Point', 'LineString', 'Polygon', 'MultiPoint', 'MultiLineString', 'MultiPolygon']
+    const unsupportedTypes = [...new Set(validFeatures.map(f => f.geometry.type).filter(t => !supportedTypes.includes(t)))]
+    
+    if (unsupportedTypes.length) {
+      throw new Error(`不支持的几何类型: ${unsupportedTypes.join(', ')}。当前仅支持 Point、LineString、Polygon 及其 Multi 类型。`)
+    }
+
+    const pointFeatures = features.filter(f => f.geometry?.type === 'Point' || f.geometry?.type === 'MultiPoint')
+    const lineFeatures = features.filter(f => f.geometry?.type === 'LineString' || f.geometry?.type === 'MultiLineString')
+    const polygonFeatures = features.filter(f => f.geometry?.type === 'Polygon' || f.geometry?.type === 'MultiPolygon')
 
     const zip = new JSZip()
 
     const processLayer = async (layerFeatures, layerName, shapeType) => {
       if (!layerFeatures.length) return
       const shpBuffer = buildShp(layerFeatures, shapeType)
-      const shxBuffer = buildShx(layerFeatures.length)
+      const shxBuffer = buildShx(layerFeatures, shapeType)
       const dbfBuffer = buildDbf(layerFeatures)
       const prjContent = buildPrj()
 
@@ -47,8 +56,9 @@ export async function exportShapefile(geojson, fileName) {
     await processLayer(lineFeatures, 'lines', 3)
     await processLayer(polygonFeatures, 'polygons', 5)
 
-    if (!zip.files['points.shp'] && !zip.files['lines.shp'] && !zip.files['polygons.shp']) {
-      throw new Error('不支持的几何类型')
+    const hasFiles = zip.files['points.shp'] || zip.files['lines.shp'] || zip.files['polygons.shp']
+    if (!hasFiles) {
+      throw new Error('没有找到可导出的要素')
     }
 
     const blob = await zip.generateAsync({ type: 'blob' })
@@ -67,11 +77,14 @@ function calcBounds(features) {
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
   features.forEach(f => {
     const coords = f.geometry.coordinates
-    if (f.geometry.type === 'Point') {
-      minX = Math.min(minX, coords[0])
-      minY = Math.min(minY, coords[1])
-      maxX = Math.max(maxX, coords[0])
-      maxY = Math.max(maxY, coords[1])
+    if (f.geometry.type === 'Point' || f.geometry.type === 'MultiPoint') {
+      const points = f.geometry.type === 'Point' ? [coords] : coords
+      points.forEach(([x, y]) => {
+        minX = Math.min(minX, x)
+        minY = Math.min(minY, y)
+        maxX = Math.max(maxX, x)
+        maxY = Math.max(maxY, y)
+      })
     } else {
       flattenCoords(coords).forEach(([x, y]) => {
         minX = Math.min(minX, x)
@@ -95,7 +108,6 @@ function flattenCoords(coords, result = []) {
 
 function buildShp(features, shapeType) {
   const bounds = calcBounds(features)
-  const numFeatures = features.length
 
   const header = new ArrayBuffer(100)
   const headerView = new DataView(header)
@@ -105,17 +117,30 @@ function buildShp(features, shapeType) {
   const contentLengths = []
   let totalContentWords = 0
 
-  features.forEach((f, i) => {
+  features.forEach((f) => {
     let contentWords
-    if (f.geometry.type === 'Point') {
+    const geomType = f.geometry.type
+    if (geomType === 'Point') {
       contentWords = 10
-    } else if (f.geometry.type === 'LineString') {
+    } else if (geomType === 'MultiPoint') {
+      const numPoints = f.geometry.coordinates.length
+      contentWords = 22 + numPoints * 2
+    } else if (geomType === 'LineString') {
       const numPoints = flattenCoords(f.geometry.coordinates).length
       contentWords = 22 + numPoints * 2
-    } else if (f.geometry.type === 'Polygon') {
+    } else if (geomType === 'MultiLineString') {
+      const numPoints = flattenCoords(f.geometry.coordinates).length
+      const numParts = f.geometry.coordinates.length
+      contentWords = 22 + numPoints * 2 + numParts * 2
+    } else if (geomType === 'Polygon') {
       const allCoords = flattenCoords(f.geometry.coordinates)
       const numPoints = allCoords.length
       const numParts = f.geometry.coordinates.length
+      contentWords = 22 + numPoints * 2 + numParts * 2
+    } else if (geomType === 'MultiPolygon') {
+      const allCoords = f.geometry.coordinates.flatMap(poly => flattenCoords(poly))
+      const numPoints = allCoords.length
+      const numParts = f.geometry.coordinates.reduce((sum, poly) => sum + poly.length, 0)
       contentWords = 22 + numPoints * 2 + numParts * 2
     }
     contentLengths.push(contentWords)
@@ -148,57 +173,122 @@ function buildShp(features, shapeType) {
     shpView.setInt32(dataOffset, shapeType, true)
     dataOffset += 4
 
-    if (f.geometry.type === 'Point') {
+    const geomType = f.geometry.type
+    if (geomType === 'Point') {
       const [x, y] = f.geometry.coordinates
       shpView.setFloat64(dataOffset, x, true)
       shpView.setFloat64(dataOffset + 8, y, true)
       dataOffset += 16
-    } else if (f.geometry.type === 'LineString') {
-      const allCoords = flattenCoords(f.geometry.coordinates)
+    } else if (geomType === 'MultiPoint') {
+      const allCoords = f.geometry.coordinates
       const numPoints = allCoords.length
-      const lineBounds = calcBounds([f])
-
-      shpView.setFloat64(dataOffset, lineBounds.minX, true)
-      shpView.setFloat64(dataOffset + 8, lineBounds.minY, true)
-      shpView.setFloat64(dataOffset + 16, lineBounds.maxX, true)
-      shpView.setFloat64(dataOffset + 24, lineBounds.maxY, true)
+      const featBounds = calcBounds([f])
+      shpView.setFloat64(dataOffset, featBounds.minX, true)
+      shpView.setFloat64(dataOffset + 8, featBounds.minY, true)
+      shpView.setFloat64(dataOffset + 16, featBounds.maxX, true)
+      shpView.setFloat64(dataOffset + 24, featBounds.maxY, true)
       dataOffset += 32
-
       shpView.setInt32(dataOffset, numPoints, true)
       dataOffset += 4
-      shpView.setInt32(dataOffset, 1, true)
-      dataOffset += 4
-
       allCoords.forEach(([x, y]) => {
         shpView.setFloat64(dataOffset, x, true)
         dataOffset += 8
         shpView.setFloat64(dataOffset, y, true)
         dataOffset += 8
       })
-    } else if (f.geometry.type === 'Polygon') {
+    } else if (geomType === 'LineString') {
       const allCoords = flattenCoords(f.geometry.coordinates)
       const numPoints = allCoords.length
-      const numParts = f.geometry.coordinates.length
-      const polyBounds = calcBounds([f])
-
-      shpView.setFloat64(dataOffset, polyBounds.minX, true)
-      shpView.setFloat64(dataOffset + 8, polyBounds.minY, true)
-      shpView.setFloat64(dataOffset + 16, polyBounds.maxX, true)
-      shpView.setFloat64(dataOffset + 24, polyBounds.maxY, true)
+      const featBounds = calcBounds([f])
+      shpView.setFloat64(dataOffset, featBounds.minX, true)
+      shpView.setFloat64(dataOffset + 8, featBounds.minY, true)
+      shpView.setFloat64(dataOffset + 16, featBounds.maxX, true)
+      shpView.setFloat64(dataOffset + 24, featBounds.maxY, true)
       dataOffset += 32
-
+      shpView.setInt32(dataOffset, numPoints, true)
+      dataOffset += 4
+      shpView.setInt32(dataOffset, 1, true)
+      dataOffset += 4
+      allCoords.forEach(([x, y]) => {
+        shpView.setFloat64(dataOffset, x, true)
+        dataOffset += 8
+        shpView.setFloat64(dataOffset, y, true)
+        dataOffset += 8
+      })
+    } else if (geomType === 'MultiLineString') {
+      const allCoords = f.geometry.coordinates.flatMap(line => line)
+      const numPoints = allCoords.length
+      const numParts = f.geometry.coordinates.length
+      const featBounds = calcBounds([f])
+      shpView.setFloat64(dataOffset, featBounds.minX, true)
+      shpView.setFloat64(dataOffset + 8, featBounds.minY, true)
+      shpView.setFloat64(dataOffset + 16, featBounds.maxX, true)
+      shpView.setFloat64(dataOffset + 24, featBounds.maxY, true)
+      dataOffset += 32
       shpView.setInt32(dataOffset, numPoints, true)
       dataOffset += 4
       shpView.setInt32(dataOffset, numParts, true)
       dataOffset += 4
-
       let pointOffset = 0
       f.geometry.coordinates.forEach(part => {
         shpView.setInt32(dataOffset, pointOffset, true)
         dataOffset += 4
         pointOffset += part.length
       })
-
+      allCoords.forEach(([x, y]) => {
+        shpView.setFloat64(dataOffset, x, true)
+        dataOffset += 8
+        shpView.setFloat64(dataOffset, y, true)
+        dataOffset += 8
+      })
+    } else if (geomType === 'Polygon') {
+      const allCoords = flattenCoords(f.geometry.coordinates)
+      const numPoints = allCoords.length
+      const numParts = f.geometry.coordinates.length
+      const featBounds = calcBounds([f])
+      shpView.setFloat64(dataOffset, featBounds.minX, true)
+      shpView.setFloat64(dataOffset + 8, featBounds.minY, true)
+      shpView.setFloat64(dataOffset + 16, featBounds.maxX, true)
+      shpView.setFloat64(dataOffset + 24, featBounds.maxY, true)
+      dataOffset += 32
+      shpView.setInt32(dataOffset, numPoints, true)
+      dataOffset += 4
+      shpView.setInt32(dataOffset, numParts, true)
+      dataOffset += 4
+      let pointOffset = 0
+      f.geometry.coordinates.forEach(part => {
+        shpView.setInt32(dataOffset, pointOffset, true)
+        dataOffset += 4
+        pointOffset += part.length
+      })
+      allCoords.forEach(([x, y]) => {
+        shpView.setFloat64(dataOffset, x, true)
+        dataOffset += 8
+        shpView.setFloat64(dataOffset, y, true)
+        dataOffset += 8
+      })
+    } else if (geomType === 'MultiPolygon') {
+      const allCoords = f.geometry.coordinates.flatMap(poly => poly.flatMap(ring => ring))
+      const numPoints = allCoords.length
+      const numParts = f.geometry.coordinates.reduce((sum, poly) => sum + poly.length, 0)
+      const featBounds = calcBounds([f])
+      shpView.setFloat64(dataOffset, featBounds.minX, true)
+      shpView.setFloat64(dataOffset + 8, featBounds.minY, true)
+      shpView.setFloat64(dataOffset + 16, featBounds.maxX, true)
+      shpView.setFloat64(dataOffset + 24, featBounds.maxY, true)
+      dataOffset += 32
+      shpView.setInt32(dataOffset, numPoints, true)
+      dataOffset += 4
+      shpView.setInt32(dataOffset, numParts, true)
+      dataOffset += 4
+      let pointOffset = 0
+      f.geometry.coordinates.forEach(poly => {
+        poly.forEach(ring => {
+          shpView.setInt32(dataOffset, pointOffset, true)
+          dataOffset += 4
+          pointOffset += ring.length
+        })
+      })
       allCoords.forEach(([x, y]) => {
         shpView.setFloat64(dataOffset, x, true)
         dataOffset += 8
@@ -214,7 +304,8 @@ function buildShp(features, shapeType) {
   return shpBuffer
 }
 
-function buildShx(numRecords) {
+function buildShx(features, shapeType) {
+  const numRecords = features.length
   const header = new ArrayBuffer(100)
   const headerView = new DataView(header)
   headerView.setInt32(0, 9994, false)
@@ -223,6 +314,7 @@ function buildShx(numRecords) {
   const fileLength = contentLength
   headerView.setInt32(24, fileLength, false)
   headerView.setInt32(28, 1000, false)
+  headerView.setInt32(32, shapeType, true)
 
   const totalBytes = 100 + numRecords * 8
   const shxBuffer = new ArrayBuffer(totalBytes)
@@ -233,7 +325,32 @@ function buildShx(numRecords) {
   let offset = 100
   let shpOffset = 50
   for (let i = 0; i < numRecords; i++) {
-    const contentWords = 10
+    const f = features[i]
+    let contentWords
+    const geomType = f.geometry.type
+    if (geomType === 'Point') {
+      contentWords = 10
+    } else if (geomType === 'MultiPoint') {
+      const numPoints = f.geometry.coordinates.length
+      contentWords = 22 + numPoints * 2
+    } else if (geomType === 'LineString') {
+      const numPoints = flattenCoords(f.geometry.coordinates).length
+      contentWords = 22 + numPoints * 2
+    } else if (geomType === 'MultiLineString') {
+      const numPoints = flattenCoords(f.geometry.coordinates).length
+      const numParts = f.geometry.coordinates.length
+      contentWords = 22 + numPoints * 2 + numParts * 2
+    } else if (geomType === 'Polygon') {
+      const allCoords = flattenCoords(f.geometry.coordinates)
+      const numPoints = allCoords.length
+      const numParts = f.geometry.coordinates.length
+      contentWords = 22 + numPoints * 2 + numParts * 2
+    } else if (geomType === 'MultiPolygon') {
+      const allCoords = f.geometry.coordinates.flatMap(poly => flattenCoords(poly))
+      const numPoints = allCoords.length
+      const numParts = f.geometry.coordinates.reduce((sum, poly) => sum + poly.length, 0)
+      contentWords = 22 + numPoints * 2 + numParts * 2
+    }
     shxView.setInt32(offset, shpOffset, false)
     shxView.setInt32(offset + 4, contentWords, false)
     shpOffset += 4 + contentWords

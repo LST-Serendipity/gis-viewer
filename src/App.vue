@@ -202,47 +202,51 @@ body {
 }
 
 .app-header {
-  text-align: center;
-  margin-bottom: 30px;
-  padding: 30px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 20px;
+  padding: 12px 24px;
   background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-  border-radius: 16px;
+  border-radius: 12px;
   color: white;
-  position: relative;
 }
 
 .app-header h1 {
-  font-size: 2.5rem;
-  margin-bottom: 10px;
+  font-size: 1.3rem;
+  white-space: nowrap;
 }
 
 .subtitle {
-  font-size: 1.1rem;
-  opacity: 0.9;
+  font-size: 0.85rem;
+  opacity: 0.85;
+  display: none;
 }
 
 .header-actions {
-  position: absolute;
-  bottom: -15px;
-  left: 50%;
-  transform: translateX(-50%);
+  position: static;
+  transform: none;
+  display: flex;
+  gap: 8px;
 }
 
 .btn-action {
-  padding: 10px 25px;
+  padding: 6px 16px;
   background: white;
   color: #667eea;
   border: none;
-  border-radius: 30px;
+  border-radius: 20px;
+  font-size: 0.85rem;
   font-weight: 600;
   cursor: pointer;
-  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.15);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.1);
   transition: all 0.2s;
+  white-space: nowrap;
 }
 
 .btn-action:hover {
-  transform: translateY(-2px);
-  box-shadow: 0 5px 15px rgba(0, 0, 0, 0.2);
+  transform: translateY(-1px);
+  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.15);
 }
 
 .btn-action.active {
