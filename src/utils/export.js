@@ -315,7 +315,7 @@ function buildShx(features, shapeType) {
     return bytes
   })
 
-  const fileLength = 50 + (totalContentBytes + numRecords * 8) / 2
+  const fileLength = 50 + numRecords * 4
   headerView.setInt32(24, fileLength, false)
   headerView.setInt32(28, 1000, false)
   headerView.setInt32(32, shapeType, true)
