@@ -46,9 +46,9 @@ export async function exportShapefile(geojson, fileName) {
       const dbfBuffer = buildDbf(layerFeatures)
       const prjContent = buildPrj()
 
-      zip.file(`${layerName}.shp`, shpBuffer)
-      zip.file(`${layerName}.shx`, shxBuffer)
-      zip.file(`${layerName}.dbf`, dbfBuffer)
+      zip.file(`${layerName}.shp`, new Uint8Array(shpBuffer))
+      zip.file(`${layerName}.shx`, new Uint8Array(shxBuffer))
+      zip.file(`${layerName}.dbf`, new Uint8Array(dbfBuffer))
       zip.file(`${layerName}.prj`, prjContent)
     }
 
@@ -358,9 +358,10 @@ function buildDbf(features) {
   const view = new DataView(arr)
 
   view.setUint8(0, 0x03)
-  view.setUint8(1, 26)
-  view.setUint8(2, 7)
-  view.setUint8(3, 26)
+  const now = new Date()
+  view.setUint8(1, now.getFullYear() - 1900)
+  view.setUint8(2, now.getMonth() + 1)
+  view.setUint8(3, now.getDate())
   view.setUint16(4, features.length, true)
   view.setUint16(8, headerLen, true)
   view.setUint16(10, recordLen, true)
