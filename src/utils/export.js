@@ -106,6 +106,33 @@ function flattenCoords(coords, result = []) {
   return result
 }
 
+function calcRecordBytes(feature) {
+  const geomType = feature.geometry.type
+  if (geomType === 'Point') {
+    return 4 + 8 + 8
+  } else if (geomType === 'MultiPoint') {
+    const numPoints = feature.geometry.coordinates.length
+    return 4 + 32 + 4 + numPoints * 16
+  } else if (geomType === 'LineString') {
+    const numPoints = flattenCoords(feature.geometry.coordinates).length
+    return 4 + 32 + 4 + 4 + numPoints * 16
+  } else if (geomType === 'MultiLineString') {
+    const numPoints = flattenCoords(feature.geometry.coordinates).length
+    const numParts = feature.geometry.coordinates.length
+    return 4 + 32 + 4 + 4 + numParts * 4 + numPoints * 16
+  } else if (geomType === 'Polygon') {
+    const numPoints = flattenCoords(feature.geometry.coordinates).length
+    const numParts = feature.geometry.coordinates.length
+    return 4 + 32 + 4 + 4 + numParts * 4 + numPoints * 16
+  } else if (geomType === 'MultiPolygon') {
+    const allCoords = feature.geometry.coordinates.flatMap(poly => flattenCoords(poly))
+    const numPoints = allCoords.length
+    const numParts = feature.geometry.coordinates.reduce((sum, poly) => sum + poly.length, 0)
+    return 4 + 32 + 4 + 4 + numParts * 4 + numPoints * 16
+  }
+  return 0
+}
+
 function buildShp(features, shapeType) {
   const bounds = calcBounds(features)
 
@@ -114,40 +141,10 @@ function buildShp(features, shapeType) {
   headerView.setInt32(0, 9994, false)
   for (let i = 1; i < 24; i++) headerView.setInt32(i * 4, 0, false)
 
-  const contentLengths = []
-  let totalContentWords = 0
+  const recordBytes = features.map(f => calcRecordBytes(f))
+  let totalContentBytes = recordBytes.reduce((a, b) => a + b, 0)
 
-  features.forEach((f) => {
-    let contentWords
-    const geomType = f.geometry.type
-    if (geomType === 'Point') {
-      contentWords = 14
-    } else if (geomType === 'MultiPoint') {
-      const numPoints = f.geometry.coordinates.length
-      contentWords = 22 + numPoints * 4
-    } else if (geomType === 'LineString') {
-      const numPoints = flattenCoords(f.geometry.coordinates).length
-      contentWords = 26 + numPoints * 8
-    } else if (geomType === 'MultiLineString') {
-      const numPoints = flattenCoords(f.geometry.coordinates).length
-      const numParts = f.geometry.coordinates.length
-      contentWords = 28 + numPoints * 8 + numParts * 2
-    } else if (geomType === 'Polygon') {
-      const allCoords = flattenCoords(f.geometry.coordinates)
-      const numPoints = allCoords.length
-      const numParts = f.geometry.coordinates.length
-      contentWords = 28 + numPoints * 8 + numParts * 2
-    } else if (geomType === 'MultiPolygon') {
-      const allCoords = f.geometry.coordinates.flatMap(poly => flattenCoords(poly))
-      const numPoints = allCoords.length
-      const numParts = f.geometry.coordinates.reduce((sum, poly) => sum + poly.length, 0)
-      contentWords = 32 + numPoints * 8 + numParts * 2
-    }
-    contentLengths.push(contentWords)
-    totalContentWords += contentWords + 4
-  })
-
-  const fileLength = 50 + totalContentWords
+  const fileLength = 50 + totalContentBytes / 2
   headerView.setInt32(24, fileLength, false)
   headerView.setInt32(28, 1000, false)
   headerView.setInt32(32, shapeType, true)
@@ -156,7 +153,7 @@ function buildShp(features, shapeType) {
   headerView.setFloat64(52, bounds.maxX, true)
   headerView.setFloat64(60, bounds.maxY, true)
 
-  const totalBytes = 100 + totalContentWords * 4
+  const totalBytes = 100 + totalContentBytes
   const shpBuffer = new ArrayBuffer(totalBytes)
   const shpView = new DataView(shpBuffer)
   const uint8 = new Uint8Array(shpBuffer)
@@ -167,7 +164,7 @@ function buildShp(features, shapeType) {
 
   features.forEach((f, i) => {
     shpView.setInt32(offset, recordNum, false)
-    shpView.setInt32(offset + 4, contentLengths[i], false)
+    shpView.setInt32(offset + 4, recordBytes[i] / 2, false)
 
     let dataOffset = offset + 8
     shpView.setInt32(dataOffset, shapeType, true)
@@ -310,8 +307,14 @@ function buildShx(features, shapeType) {
   const headerView = new DataView(header)
   headerView.setInt32(0, 9994, false)
 
-  const contentLength = 50 + numRecords * 4
-  const fileLength = contentLength
+  let totalContentBytes = 0
+  const contentBytes = features.map(f => {
+    const bytes = calcRecordBytes(f)
+    totalContentBytes += bytes
+    return bytes
+  })
+
+  const fileLength = 50 + totalContentBytes / 2
   headerView.setInt32(24, fileLength, false)
   headerView.setInt32(28, 1000, false)
   headerView.setInt32(32, shapeType, true)
@@ -325,35 +328,9 @@ function buildShx(features, shapeType) {
   let offset = 100
   let shpOffset = 50
   for (let i = 0; i < numRecords; i++) {
-    const f = features[i]
-    let contentWords
-    const geomType = f.geometry.type
-    if (geomType === 'Point') {
-      contentWords = 10
-    } else if (geomType === 'MultiPoint') {
-      const numPoints = f.geometry.coordinates.length
-      contentWords = 22 + numPoints * 2
-    } else if (geomType === 'LineString') {
-      const numPoints = flattenCoords(f.geometry.coordinates).length
-      contentWords = 22 + numPoints * 2
-    } else if (geomType === 'MultiLineString') {
-      const numPoints = flattenCoords(f.geometry.coordinates).length
-      const numParts = f.geometry.coordinates.length
-      contentWords = 22 + numPoints * 2 + numParts * 2
-    } else if (geomType === 'Polygon') {
-      const allCoords = flattenCoords(f.geometry.coordinates)
-      const numPoints = allCoords.length
-      const numParts = f.geometry.coordinates.length
-      contentWords = 22 + numPoints * 2 + numParts * 2
-    } else if (geomType === 'MultiPolygon') {
-      const allCoords = f.geometry.coordinates.flatMap(poly => flattenCoords(poly))
-      const numPoints = allCoords.length
-      const numParts = f.geometry.coordinates.reduce((sum, poly) => sum + poly.length, 0)
-      contentWords = 22 + numPoints * 2 + numParts * 2
-    }
     shxView.setInt32(offset, shpOffset, false)
-    shxView.setInt32(offset + 4, contentWords, false)
-    shpOffset += 4 + contentWords
+    shxView.setInt32(offset + 4, contentBytes[i] / 2, false)
+    shpOffset += 4 + contentBytes[i] / 2
     offset += 8
   }
 
