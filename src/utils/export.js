@@ -143,8 +143,9 @@ function buildShp(features, shapeType) {
 
   const recordBytes = features.map(f => calcRecordBytes(f))
   let totalContentBytes = recordBytes.reduce((a, b) => a + b, 0)
+  const recordHeaderBytes = features.length * 8
 
-  const fileLength = 50 + totalContentBytes / 2
+  const fileLength = 50 + (totalContentBytes + recordHeaderBytes) / 2
   headerView.setInt32(24, fileLength, false)
   headerView.setInt32(28, 1000, false)
   headerView.setInt32(32, shapeType, true)
@@ -153,7 +154,7 @@ function buildShp(features, shapeType) {
   headerView.setFloat64(52, bounds.maxX, true)
   headerView.setFloat64(60, bounds.maxY, true)
 
-  const totalBytes = 100 + totalContentBytes
+  const totalBytes = 100 + recordHeaderBytes + totalContentBytes
   const shpBuffer = new ArrayBuffer(totalBytes)
   const shpView = new DataView(shpBuffer)
   const uint8 = new Uint8Array(shpBuffer)
@@ -314,7 +315,7 @@ function buildShx(features, shapeType) {
     return bytes
   })
 
-  const fileLength = 50 + totalContentBytes / 2
+  const fileLength = 50 + (totalContentBytes + numRecords * 8) / 2
   headerView.setInt32(24, fileLength, false)
   headerView.setInt32(28, 1000, false)
   headerView.setInt32(32, shapeType, true)
