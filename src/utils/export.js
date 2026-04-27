@@ -121,27 +121,27 @@ function buildShp(features, shapeType) {
     let contentWords
     const geomType = f.geometry.type
     if (geomType === 'Point') {
-      contentWords = 10
+      contentWords = 14
     } else if (geomType === 'MultiPoint') {
       const numPoints = f.geometry.coordinates.length
-      contentWords = 22 + numPoints * 2
+      contentWords = 22 + numPoints * 4
     } else if (geomType === 'LineString') {
       const numPoints = flattenCoords(f.geometry.coordinates).length
-      contentWords = 22 + numPoints * 2
+      contentWords = 26 + numPoints * 8
     } else if (geomType === 'MultiLineString') {
       const numPoints = flattenCoords(f.geometry.coordinates).length
       const numParts = f.geometry.coordinates.length
-      contentWords = 22 + numPoints * 2 + numParts * 2
+      contentWords = 28 + numPoints * 8 + numParts * 2
     } else if (geomType === 'Polygon') {
       const allCoords = flattenCoords(f.geometry.coordinates)
       const numPoints = allCoords.length
       const numParts = f.geometry.coordinates.length
-      contentWords = 22 + numPoints * 2 + numParts * 2
+      contentWords = 28 + numPoints * 8 + numParts * 2
     } else if (geomType === 'MultiPolygon') {
       const allCoords = f.geometry.coordinates.flatMap(poly => flattenCoords(poly))
       const numPoints = allCoords.length
       const numParts = f.geometry.coordinates.reduce((sum, poly) => sum + poly.length, 0)
-      contentWords = 22 + numPoints * 2 + numParts * 2
+      contentWords = 32 + numPoints * 8 + numParts * 2
     }
     contentLengths.push(contentWords)
     totalContentWords += contentWords + 4
