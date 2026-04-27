@@ -350,7 +350,7 @@ function buildDbf(features) {
   })
 
   const headerLen = 32 + headers.length * 32 + 1
-  const recordLen = headers.reduce((sum, h) => sum + h.length, 0) + 1
+  const recordLen = headers.reduce((sum, h) => sum + h.length, 0) + 2
   const fileLen = headerLen + features.length * recordLen + 1
 
   const arr = new ArrayBuffer(fileLen)
