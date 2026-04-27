@@ -19,7 +19,25 @@ export async function exportShapefile(geojson, fileName) {
   const baseName = fileName.replace(/\.[^.]+$/, '')
   
   try {
-    const features = geojson.type === 'FeatureCollection' ? geojson.features : [geojson]
+    let features = geojson.type === 'FeatureCollection' ? geojson.features : [geojson]
+
+    // Expand GeometryCollection into individual features
+    const expandedFeatures = []
+    features.forEach(f => {
+      if (f.geometry?.type === 'GeometryCollection') {
+        f.geometry.geometries.forEach(geom => {
+          expandedFeatures.push({
+            type: 'Feature',
+            geometry: geom,
+            properties: { ...f.properties, _orig_id: f.id || f.properties?.id || '' }
+          })
+        })
+      } else {
+        expandedFeatures.push(f)
+      }
+    })
+    features = expandedFeatures
+
     const validFeatures = features.filter(f => f.geometry?.type)
 
     if (!validFeatures.length) {
@@ -115,7 +133,7 @@ function calcRecordBytes(feature) {
     return 4 + 32 + 4 + numPoints * 16
   } else if (geomType === 'LineString') {
     const numPoints = flattenCoords(feature.geometry.coordinates).length
-    return 4 + 32 + 4 + 4 + numPoints * 16
+    return 4 + 32 + 4 + 4 + 4 + numPoints * 16
   } else if (geomType === 'MultiLineString') {
     const numPoints = flattenCoords(feature.geometry.coordinates).length
     const numParts = feature.geometry.coordinates.length
@@ -203,9 +221,11 @@ function buildShp(features, shapeType) {
       shpView.setFloat64(dataOffset + 16, featBounds.maxX, true)
       shpView.setFloat64(dataOffset + 24, featBounds.maxY, true)
       dataOffset += 32
+      shpView.setInt32(dataOffset, 1, true)
+      dataOffset += 4
       shpView.setInt32(dataOffset, numPoints, true)
       dataOffset += 4
-      shpView.setInt32(dataOffset, 1, true)
+      shpView.setInt32(dataOffset, 0, true)
       dataOffset += 4
       allCoords.forEach(([x, y]) => {
         shpView.setFloat64(dataOffset, x, true)
@@ -223,9 +243,9 @@ function buildShp(features, shapeType) {
       shpView.setFloat64(dataOffset + 16, featBounds.maxX, true)
       shpView.setFloat64(dataOffset + 24, featBounds.maxY, true)
       dataOffset += 32
-      shpView.setInt32(dataOffset, numPoints, true)
-      dataOffset += 4
       shpView.setInt32(dataOffset, numParts, true)
+      dataOffset += 4
+      shpView.setInt32(dataOffset, numPoints, true)
       dataOffset += 4
       let pointOffset = 0
       f.geometry.coordinates.forEach(part => {
@@ -249,9 +269,9 @@ function buildShp(features, shapeType) {
       shpView.setFloat64(dataOffset + 16, featBounds.maxX, true)
       shpView.setFloat64(dataOffset + 24, featBounds.maxY, true)
       dataOffset += 32
-      shpView.setInt32(dataOffset, numPoints, true)
-      dataOffset += 4
       shpView.setInt32(dataOffset, numParts, true)
+      dataOffset += 4
+      shpView.setInt32(dataOffset, numPoints, true)
       dataOffset += 4
       let pointOffset = 0
       f.geometry.coordinates.forEach(part => {
@@ -275,9 +295,9 @@ function buildShp(features, shapeType) {
       shpView.setFloat64(dataOffset + 16, featBounds.maxX, true)
       shpView.setFloat64(dataOffset + 24, featBounds.maxY, true)
       dataOffset += 32
-      shpView.setInt32(dataOffset, numPoints, true)
-      dataOffset += 4
       shpView.setInt32(dataOffset, numParts, true)
+      dataOffset += 4
+      shpView.setInt32(dataOffset, numPoints, true)
       dataOffset += 4
       let pointOffset = 0
       f.geometry.coordinates.forEach(poly => {

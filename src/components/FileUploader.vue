@@ -80,7 +80,8 @@ const processGeoJSON = async (file) => {
 
 const processShapefileZip = async (file) => {
   const arrayBuffer = await file.arrayBuffer()
-  const geojson = await getShapefile(arrayBuffer)
+  const uint8Array = new Uint8Array(arrayBuffer)
+  const geojson = await getShapefile(uint8Array)
   
   const geojsonCollection = normalizeToFeatureCollection(geojson)
   const properties = getFileProperties(geojsonCollection)
