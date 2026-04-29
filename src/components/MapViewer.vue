@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted, watch, provide } from 'vue'
+import { ref, onMounted, watch, provide, shallowRef } from 'vue'
 import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
 import 'leaflet.markercluster'
@@ -26,7 +26,10 @@ const props = defineProps({
 
 const emit = defineEmits(['map-ready', 'features-updated', 'basemap-change'])
 
-const CLUSTER_THRESHOLD = 20
+const CLUSTER_THRESHOLD = 50
+const MAX_FEATURES_WITHOUT_CLUSTER = 500
+const RENDER_BATCH_SIZE = 200
+const VIEWPORT_BUFFER = 0.1
 
 const basemaps = {
   osm: L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }),
@@ -40,42 +43,78 @@ let currentBasemap = 'osm'
 const mapContainer = ref(null)
 let map = null
 let drawControl = null
-const layerRegistry = ref({})
+const layerRegistry = shallowRef({})
 const drawnItems = new L.FeatureGroup()
+const isLoading = ref(false)
+const renderProgress = ref(0)
 
-const countPointFeatures = (geojsonData) => {
-  const features = geojsonData.type === 'FeatureCollection' ? geojsonData.features : [geojsonData]
-  return features.filter(f => f.geometry && f.geometry.type === 'Point').length
-}
+// Web Worker for geometry processing
+let geoWorker = null
 
 const getClusterRadius = (count) => {
+  if (count > 5000) return 80
+  if (count > 2000) return 70
   if (count > 1000) return 60
   if (count > 500) return 55
   if (count > 100) return 50
-  if (count > 50) return 45
-  if (count > 10) return 40
-  return 35
+  return 45
 }
 
-const applyStyleToLayer = (layer, style, layerData) => {
-  if (layer instanceof L.CircleMarker) {
-    layer.setStyle({
-      radius: style?.pointRadius || layerData?.pointRadius || 7,
-      fillColor: style?.fillColor || layerData?.color || '#667eea',
-      color: style?.color || layerData?.color || '#667eea',
-      weight: style?.lineWidth || layerData?.lineWidth || 2,
-      fillOpacity: (style?.fillOpacity ?? 0.9) * (layerData?.opacity ?? 1),
-      opacity: (style?.strokeOpacity ?? 1) * (layerData?.opacity ?? 1)
-    })
-  } else if (layer instanceof L.Path) {
-    layer.setStyle({
-      color: style?.color || layerData?.color || '#667eea',
-      weight: style?.lineWidth || layerData?.lineWidth || 2,
-      fillColor: style?.fillColor || layerData?.color || '#667eea',
-      fillOpacity: (style?.fillOpacity ?? 0.2) * (layerData?.opacity ?? 1),
-      opacity: (style?.strokeOpacity ?? 1) * (layerData?.opacity ?? 1)
-    })
+// Check if feature is in viewport
+const isFeatureInViewport = (feature, bounds) => {
+  if (!feature.geometry) return false
+
+  const geom = feature.geometry
+  const checkCoord = (coord) => {
+    return coord[0] >= bounds.getWest() - VIEWPORT_BUFFER &&
+           coord[0] <= bounds.getEast() + VIEWPORT_BUFFER &&
+           coord[1] >= bounds.getSouth() - VIEWPORT_BUFFER &&
+           coord[1] <= bounds.getNorth() + VIEWPORT_BUFFER
   }
+
+  switch (geom.type) {
+    case 'Point':
+      return checkCoord(geom.coordinates)
+    case 'MultiPoint':
+    case 'LineString':
+      return geom.coordinates.some(checkCoord)
+    case 'Polygon':
+      return geom.coordinates[0].some(checkCoord)
+    case 'MultiPolygon':
+      return geom.coordinates.some(poly => poly[0].some(checkCoord))
+    default:
+      return true
+  }
+}
+
+// Batch render features
+const renderFeaturesBatched = async (features, createLayer, onProgress) => {
+  const total = features.length
+  const layers = []
+
+  for (let i = 0; i < total; i += RENDER_BATCH_SIZE) {
+    const batch = features.slice(i, Math.min(i + RENDER_BATCH_SIZE, total))
+
+    batch.forEach(feature => {
+      try {
+        const layer = createLayer(feature)
+        if (layer) layers.push(layer)
+      } catch (e) {
+        console.warn('Failed to render feature:', e)
+      }
+    })
+
+    if (onProgress) {
+      onProgress(Math.min(i + RENDER_BATCH_SIZE, total), total)
+    }
+
+    // Yield to main thread
+    if (i + RENDER_BATCH_SIZE < total) {
+      await new Promise(resolve => requestAnimationFrame(resolve))
+    }
+  }
+
+  return layers
 }
 
 const removeLayerFromMap = (id) => {
@@ -88,10 +127,8 @@ const removeLayerFromMap = (id) => {
   }
 }
 
-const addSingleLayer = (layerData) => {
+const addSingleLayer = async (layerData) => {
   const { id, geojson, color, visible, opacity, style } = layerData
-  const pointCount = countPointFeatures(geojson)
-  const useCluster = pointCount >= CLUSTER_THRESHOLD
 
   removeLayerFromMap(id)
   if (!visible) {
@@ -99,89 +136,51 @@ const addSingleLayer = (layerData) => {
     return
   }
 
-  const nonPointGeoJSON = {
-    type: 'FeatureCollection',
-    features: (geojson.type === 'FeatureCollection' ? geojson.features : [geojson])
-      .filter(f => f.geometry && f.geometry.type !== 'Point')
+  isLoading.value = true
+  renderProgress.value = 0
+
+  const features = geojson.type === 'FeatureCollection' ? geojson.features : [geojson]
+  const totalFeatures = features.length
+
+  // For very large datasets, use viewport clipping
+  const useViewportClipping = totalFeatures > 1000
+  const bounds = map.getBounds()
+
+  let filteredFeatures = features
+  if (useViewportClipping) {
+    filteredFeatures = features.filter(f => isFeatureInViewport(f, bounds))
   }
 
-  let geojsonLayer
+  // Separate points and non-points
+  const pointFeatures = []
+  const nonPointFeatures = []
+
+  filteredFeatures.forEach(f => {
+    if (!f.geometry) return
+    if (f.geometry.type === 'Point' || f.geometry.type === 'MultiPoint') {
+      pointFeatures.push(f)
+    } else {
+      nonPointFeatures.push(f)
+    }
+  })
+
+  const useCluster = pointFeatures.length >= CLUSTER_THRESHOLD
+
   let clusterGroup = null
   let nonPointLayer = null
 
-  const defaultPointStyle = {
-    radius: style?.pointRadius || 7,
-    fillColor: style?.fillColor || color,
-    color: style?.color || color,
-    weight: style?.lineWidth || 2,
-    fillOpacity: (style?.fillOpacity ?? 0.9) * opacity,
-    opacity: (style?.strokeOpacity ?? 1) * opacity
-  }
-
-  const defaultLineStyle = {
-    color: style?.color || color,
-    weight: style?.lineWidth || 2,
-    fillColor: style?.fillColor || color,
-    fillOpacity: (style?.fillOpacity ?? 0.2) * opacity,
-    opacity: (style?.strokeOpacity ?? 1) * opacity
-  }
-
-  if (useCluster) {
-    clusterGroup = L.markerClusterGroup({
-      showCoverageOnHover: false,
-      maxClusterRadius: 45,
-      spiderfyOnMaxZoom: true,
-      spiderfyDistanceMultiplier: 1.5,
-      animate: true,
-      animateAddingMarkers: true,
-      disableClusteringAtZoom: 15,
-      iconCreateFunction: function(cluster) {
-        const count = cluster.getChildCount()
-        const radius = getClusterRadius(count)
-        return L.divIcon({
-          html: `<div class="cluster-circle" style="width:${radius}px;height:${radius}px;background:${color};">
-            <span class="cluster-count">${count}</span></div>`,
-          className: 'cluster-wrapper',
-          iconSize: L.point(radius, radius)
-        })
-      }
-    })
-
-    geojsonLayer = L.geoJSON(geojson, {
-      pointToLayer: (feature, latlng) => L.circleMarker(latlng, defaultPointStyle),
-      style: defaultLineStyle,
-      onEachFeature: (feature, layer) => {
-        if (feature.properties && Object.keys(feature.properties).length > 0) {
-          const content = Object.entries(feature.properties)
-            .map(([k, v]) => `<strong>${k}:</strong> ${v}`).join('<br/>')
-          layer.bindPopup(content)
-        }
-        applyStyleToLayer(layer, style, { color, opacity })
-      }
-    })
-
-    geojsonLayer.eachLayer(layer => {
-      if (layer instanceof L.CircleMarker) clusterGroup.addLayer(layer)
-    })
-
-    if (nonPointGeoJSON.features.length > 0) {
-      nonPointLayer = L.geoJSON(nonPointGeoJSON, {
-        style: defaultLineStyle,
-        onEachFeature: (feature, layer) => {
-          if (feature.properties && Object.keys(feature.properties).length > 0) {
-            const content = Object.entries(feature.properties)
-              .map(([k, v]) => `<strong>${k}:</strong> ${v}`).join('<br/>')
-            layer.bindPopup(content)
-          }
-        }
-      }).addTo(map)
+  // Render non-point features
+  if (nonPointFeatures.length > 0) {
+    const defaultStyle = {
+      color: style?.color || color,
+      weight: style?.lineWidth || 2,
+      fillColor: style?.fillColor || color,
+      fillOpacity: (style?.fillOpacity ?? 0.2) * opacity,
+      opacity: (style?.strokeOpacity ?? 1) * opacity
     }
 
-    clusterGroup.addTo(map)
-  } else {
-    geojsonLayer = L.geoJSON(geojson, {
-      pointToLayer: (feature, latlng) => L.circleMarker(latlng, defaultPointStyle),
-      style: defaultLineStyle,
+    nonPointLayer = L.geoJSON(null, {
+      style: defaultStyle,
       onEachFeature: (feature, layer) => {
         if (feature.properties && Object.keys(feature.properties).length > 0) {
           const content = Object.entries(feature.properties)
@@ -190,23 +189,135 @@ const addSingleLayer = (layerData) => {
         }
       }
     }).addTo(map)
+
+    await renderFeaturesBatched(
+      nonPointFeatures,
+      (feature) => {
+        const layer = L.geoJSON(feature, {
+          style: defaultStyle,
+          onEachFeature: (f, l) => {
+            if (f.properties && Object.keys(f.properties).length > 0) {
+              const content = Object.entries(f.properties)
+                .map(([k, v]) => `<strong>${k}:</strong> ${v}`).join('<br/>')
+              l.bindPopup(content)
+            }
+          }
+        })
+        if (layer) {
+          layer.eachLayer(l => nonPointLayer.addLayer(l))
+        }
+        return layer
+      },
+      (current, total) => {
+        renderProgress.value = Math.round((current / total) * 50)
+      }
+    )
   }
 
-  layerRegistry.value[id] = { clusterGroup, layer: geojsonLayer, nonPointLayer }
+  // Render point features
+  if (pointFeatures.length > 0) {
+    const defaultPointStyle = {
+      radius: style?.pointRadius || 6,
+      fillColor: style?.fillColor || color,
+      color: style?.color || color,
+      weight: style?.lineWidth || 2,
+      fillOpacity: (style?.fillOpacity ?? 0.9) * opacity,
+      opacity: (style?.strokeOpacity ?? 1) * opacity
+    }
+
+    if (useCluster) {
+      clusterGroup = L.markerClusterGroup({
+        showCoverageOnHover: false,
+        maxClusterRadius: getClusterRadius(pointFeatures.length),
+        spiderfyOnMaxZoom: true,
+        spiderfyDistanceMultiplier: 1.5,
+        animate: pointFeatures.length < 1000,
+        animateAddingMarkers: pointFeatures.length < 500,
+        disableClusteringAtZoom: 16,
+        chunkedLoading: true,
+        chunkProgress: (processed, total) => {
+          renderProgress.value = 50 + Math.round((processed / total) * 50)
+        },
+        iconCreateFunction: (cluster) => {
+          const count = cluster.getChildCount()
+          const radius = getClusterRadius(count)
+          return L.divIcon({
+            html: `<div class="cluster-circle" style="width:${radius}px;height:${radius}px;background:${color};">
+              <span class="cluster-count">${count}</span></div>`,
+            className: 'cluster-wrapper',
+            iconSize: L.point(radius, radius)
+          })
+        }
+      })
+
+      await renderFeaturesBatched(
+        pointFeatures,
+        (feature) => {
+          const coords = feature.geometry.coordinates
+          const marker = L.circleMarker([coords[1], coords[0]], defaultPointStyle)
+          if (feature.properties) {
+            const content = Object.entries(feature.properties)
+              .map(([k, v]) => `<strong>${k}:</strong> ${v}`).join('<br/>')
+            marker.bindPopup(content)
+          }
+          clusterGroup.addLayer(marker)
+          return marker
+        },
+        (current, total) => {
+          renderProgress.value = 50 + Math.round((current / total) * 50)
+        }
+      )
+
+      clusterGroup.addTo(map)
+    } else {
+      const pointLayer = L.layerGroup().addTo(map)
+
+      await renderFeaturesBatched(
+        pointFeatures,
+        (feature) => {
+          const coords = feature.geometry.coordinates
+          const marker = L.circleMarker([coords[1], coords[0]], defaultPointStyle)
+          if (feature.properties) {
+            const content = Object.entries(feature.properties)
+              .map(([k, v]) => `<strong>${k}:</strong> ${v}`).join('<br/>')
+            marker.bindPopup(content)
+          }
+          pointLayer.addLayer(marker)
+          return marker
+        },
+        (current, total) => {
+          renderProgress.value = 50 + Math.round((current / total) * 50)
+        }
+      )
+    }
+  }
+
+  layerRegistry.value[id] = { clusterGroup, layer: null, nonPointLayer }
+  isLoading.value = false
+  renderProgress.value = 100
 }
 
-const addAllLayers = (layers) => {
-  layers.forEach(layer => addSingleLayer(layer))
+const addAllLayers = async (layers) => {
+  for (const layer of layers) {
+    await addSingleLayer(layer)
+  }
+
   const allBounds = L.latLngBounds()
   layers.forEach(layer => {
-    const reg = layerRegistry.value[layer.id]
-    if (reg) {
-      if (reg.clusterGroup) { const b = reg.clusterGroup.getBounds(); if (b.isValid()) allBounds.extend(b) }
-      if (reg.layer && !reg.clusterGroup) { const b = reg.layer.getBounds(); if (b.isValid()) allBounds.extend(b) }
-      if (reg.nonPointLayer) { const b = reg.nonPointLayer.getBounds(); if (b.isValid()) allBounds.extend(b) }
+    const geojson = layer.geojson
+    if (geojson.type === 'FeatureCollection' && geojson.features.length > 0) {
+      geojson.features.forEach(f => {
+        if (f.geometry && f.geometry.type === 'Point') {
+          const coords = f.geometry.coordinates
+          allBounds.extend([coords[1], coords[0]])
+        }
+      })
     }
   })
-  if (allBounds.isValid()) map.fitBounds(allBounds, { padding: [50, 50] })
+
+  if (allBounds.isValid()) {
+    map.fitBounds(allBounds, { padding: [50, 50], maxZoom: 10 })
+  }
 }
 
 const switchBasemap = (id) => {
@@ -250,22 +361,54 @@ const toggleEditMode = (enable) => {
   }
 }
 
+// Debounced layer update
+let layerUpdateTimeout = null
 watch(() => props.layers, (newLayers) => {
   if (!map) return
-  const oldIds = Object.keys(layerRegistry.value).map(Number)
-  const newIds = newLayers.map(l => l.id)
-  oldIds.forEach(id => { if (!newIds.includes(id)) removeLayerFromMap(id) })
-  newLayers.forEach(layer => addSingleLayer(layer))
+
+  if (layerUpdateTimeout) clearTimeout(layerUpdateTimeout)
+  layerUpdateTimeout = setTimeout(() => {
+    const oldIds = Object.keys(layerRegistry.value).map(Number)
+    const newIds = newLayers.map(l => l.id)
+    oldIds.forEach(id => { if (!newIds.includes(id)) removeLayerFromMap(id) })
+    newLayers.forEach(layer => addSingleLayer(layer))
+  }, 100)
 }, { deep: true })
 
 watch(() => props.editMode, (newVal) => {
   toggleEditMode(newVal)
 })
 
+// Viewport update on map move
+let viewportTimeout = null
+const updateViewport = () => {
+  if (viewportTimeout) clearTimeout(viewportTimeout)
+  viewportTimeout = setTimeout(() => {
+    // Re-render layers with viewport clipping if needed
+    props.layers.forEach(layer => {
+      const features = layer.geojson.type === 'FeatureCollection'
+        ? layer.geojson.features
+        : [layer.geojson]
+
+      if (features.length > 1000) {
+        addSingleLayer(layer)
+      }
+    })
+  }, 300)
+}
+
 onMounted(() => {
   if (!mapContainer.value) return
-  map = L.map(mapContainer.value).setView([35.8617, 104.1954], 3)
+
+  map = L.map(mapContainer.value, {
+    preferCanvas: true,
+    renderer: L.canvas()
+  }).setView([35.8617, 104.1954], 3)
+
   basemaps[currentBasemap].addTo(map)
+
+  map.on('moveend zoomend', updateViewport)
+
   addAllLayers(props.layers)
   emit('map-ready', { map, switchBasemap })
 })
@@ -277,6 +420,18 @@ provide('map', map)
   <div class="map-wrapper">
     <div class="map-container">
       <div ref="mapContainer" class="map-viewer"></div>
+
+      <!-- Loading indicator -->
+      <div v-if="isLoading" class="loading-overlay">
+        <div class="loading-content">
+          <div class="spinner"></div>
+          <p>正在渲染数据... {{ renderProgress }}%</p>
+          <div class="progress-bar">
+            <div class="progress-fill" :style="{ width: renderProgress + '%' }"></div>
+          </div>
+        </div>
+      </div>
+
       <div class="basemap-switcher">
         <button
           v-for="bm in [
@@ -314,6 +469,52 @@ provide('map', map)
 .map-viewer {
   height: 500px;
   width: 100%;
+}
+
+.loading-overlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(255, 255, 255, 0.9);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.loading-content {
+  text-align: center;
+}
+
+.spinner {
+  width: 50px;
+  height: 50px;
+  border: 4px solid #e2e8f0;
+  border-top-color: #667eea;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  margin: 0 auto 15px;
+}
+
+.progress-bar {
+  width: 200px;
+  height: 6px;
+  background: #e2e8f0;
+  border-radius: 3px;
+  overflow: hidden;
+  margin-top: 10px;
+}
+
+.progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #667eea, #764ba2);
+  transition: width 0.3s ease;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
 }
 
 .basemap-switcher {
